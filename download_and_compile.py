@@ -7,21 +7,18 @@ from tqdm import tqdm
 from datetime import datetime
 
 
-# Yields all year-month commbinations from start to now
+# Yields all year-month combinations from now now to start
 def get_year_months(start_year, start_month):
-    end_year = datetime.now().year
-    end_month = datetime.now().month
-
-    year = start_year
-    month = start_month
-    while year < end_year or (year == end_year and month < end_month):
+    now = datetime.now()
+    year, month = now.year, now.month
+    while year > start_year or (year == start_year and month > start_month):
         yield year, month
 
-        if month == 12:
-            month = 1
-            year += 1
+        if month == 1:
+            month = 12
+            year -= 1
         else:
-            month += 1
+            month -= 1
 
 
 # Function to extract year and month from URL
@@ -42,6 +39,20 @@ def download_file_with_progress(url, zip_path):
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
         },
     )
+    first_chunk = next(response.iter_content(1024), None)
+
+    if not first_chunk:
+        print("Error: Empty response")
+        return False
+
+    if b"<html" in first_chunk.lower() or first_chunk.startswith(b"<!DOCTYPE"):
+        print("Error: Remote ZIP does not exist (HTML page returned)")
+        return False
+
+    if not first_chunk.startswith(b"PK"):
+        print("Error: Response is not a valid ZIP file")
+        return False
+
     total_size = int(response.headers.get("content-length", 0))
     block_size = 1024
 
@@ -49,18 +60,19 @@ def download_file_with_progress(url, zip_path):
         total=total_size,
         unit="iB",
         unit_scale=True,
-        desc=f"Downloading {url.split('=')[-1]}",
+        desc="Downloading",
     )
 
     with open(zip_path, "wb") as f:
-        for data in response.iter_content(block_size):
-            progress_bar.update(len(data))
-            f.write(data)
-    progress_bar.close()
+        f.write(first_chunk)
+        progress_bar.update(len(first_chunk))
 
-    if total_size != 0 and progress_bar.n != total_size:
-        print("Error: Something went wrong during the download")
-        return False
+        for chunk in response.iter_content(block_size):
+            if chunk:
+                f.write(chunk)
+                progress_bar.update(len(chunk))
+
+    progress_bar.close()
     return True
 
 
@@ -76,10 +88,11 @@ def process_and_append_to_csv(
         success = download_file_with_progress(url, zip_path)
         if not success:
             print(f"Error downloading file: {url}")
-            return
+            return False
     else:
         print("Reading from cached file:", zip_path)
 
+    success = True
     try:
         with zipfile.ZipFile(zip_path) as z:
             tipo_unidade_file = f"tbTipoUnidade{period}.csv"
@@ -152,6 +165,7 @@ def process_and_append_to_csv(
                     merged_df = estabelecimento_df
                     merged_df["CO_TIPO_ESTABELECIMENTO"] = pd.NA
                     merged_df["DS_TIPO_ESTABELECIMENTO"] = ""
+                    success = False
 
                 merged_df = pd.merge(
                     merged_df,
@@ -173,8 +187,12 @@ def process_and_append_to_csv(
 
     except zipfile.BadZipFile:
         print(f"Corrupted zip file: {zip_path}. Skipping...")
+        success = False
     except OSError as e:
         print(f"OSError processing {zip_path}: {e}. Skipping...")
+        success = False
+
+    return success
 
 
 # Load configurations for download and compilation
@@ -191,13 +209,19 @@ if os.path.exists(output_file):
     print(f"Output file {output_file} already exists. It will be re-created.")
     os.remove(output_file)
 
+# Check if only last period should be considered
+only_last_period = config.getboolean("compile", "compile_only_last_period")
+
 # Iterate over each period, downloading files and processing them
 start_year = config.getint("download", "start_year")
 start_month = config.getint("download", "start_month")
 url_template = config.get("download", "url_template")
 for year, month in get_year_months(start_year, start_month):
-    process_and_append_to_csv(
+    result = process_and_append_to_csv(
         year, month, prefix, url_template, download_dir, output_file
     )
 
-print("Processing complete. Combined data saved to ", output_file)
+    if result is True and only_last_period:
+        break
+
+print("Processing complete. Data saved to ", output_file)
